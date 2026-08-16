@@ -1,4 +1,6 @@
 import math
+import hashlib
+from fractions import Fraction
 
 import numpy as np
 import pandas as pd
@@ -135,12 +137,114 @@ def standard_generator_template(
     return Q
 
 
+def parse_q_value(value) -> float:
+    """Parse a Q-matrix entry written as a decimal or fraction."""
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        raise ValueError("Q contains empty cells.")
+
+    text = str(value).strip()
+    if text == "":
+        raise ValueError("Q contains empty cells.")
+
+    # Decimal comma is accepted when the file delimiter is not a comma
+    # (for example, semicolon-separated CSV files).
+    text = text.replace(",", ".")
+
+    try:
+        if "/" in text:
+            return float(Fraction(text))
+        return float(text)
+    except Exception as exc:
+        raise ValueError(f"Invalid Q-matrix value: {value}") from exc
+
+
 def coerce_editor_to_matrix(editor_df: pd.DataFrame) -> np.ndarray:
-    numeric = editor_df.apply(pd.to_numeric, errors="coerce")
-    Q = numeric.to_numpy(dtype=float)
+    Q = np.zeros(editor_df.shape, dtype=float)
+    for i in range(editor_df.shape[0]):
+        for j in range(editor_df.shape[1]):
+            Q[i, j] = parse_q_value(editor_df.iat[i, j])
+
     if np.any(~np.isfinite(Q)):
         raise ValueError("Q contains empty or non-numeric cells.")
     return Q
+
+
+def load_generator_matrix_file(uploaded_file) -> tuple[pd.DataFrame, str]:
+    """
+    Read a headerless/indexless generator matrix from CSV or Excel.
+
+    The file must contain only matrix values. Decimal values and fractions may
+    be mixed. CSV delimiter detection is automatic.
+    """
+    filename = uploaded_file.name.lower()
+    raw_bytes = uploaded_file.getvalue()
+    file_signature = hashlib.sha256(raw_bytes).hexdigest()[:16]
+
+    try:
+        if filename.endswith(".csv"):
+            uploaded_file.seek(0)
+            raw = pd.read_csv(
+                uploaded_file,
+                header=None,
+                sep=None,
+                engine="python",
+                dtype=str,
+            )
+        elif filename.endswith(".xlsx"):
+            uploaded_file.seek(0)
+            raw = pd.read_excel(
+                uploaded_file,
+                header=None,
+                dtype=object,
+                engine="openpyxl",
+            )
+        elif filename.endswith(".xls"):
+            uploaded_file.seek(0)
+            raw = pd.read_excel(
+                uploaded_file,
+                header=None,
+                dtype=object,
+            )
+        else:
+            raise ValueError("Unsupported file type. Use CSV, XLSX, or XLS.")
+    except ImportError as exc:
+        if filename.endswith(".xlsx"):
+            raise ValueError(
+                "Reading XLSX files requires openpyxl. Add 'openpyxl' to requirements.txt."
+            ) from exc
+        if filename.endswith(".xls"):
+            raise ValueError(
+                "Reading legacy XLS files may require xlrd. Add 'xlrd' to requirements.txt."
+            ) from exc
+        raise
+    except Exception as exc:
+        raise ValueError(f"The uploaded file could not be read: {exc}") from exc
+
+    # Ignore completely empty exterior rows/columns, but not empty cells inside Q.
+    raw = raw.dropna(axis=0, how="all").dropna(axis=1, how="all")
+
+    if raw.empty:
+        raise ValueError("The uploaded file is empty.")
+    if raw.shape[0] != raw.shape[1]:
+        raise ValueError(
+            f"Q must be square. The uploaded matrix has shape {raw.shape[0]} × {raw.shape[1]}."
+        )
+    if raw.shape[0] < 2:
+        raise ValueError("Q must contain at least states 0 and 1.")
+    if raw.shape[0] > 101:
+        raise ValueError("The uploaded matrix may contain at most 101 states (0 through 100).")
+    if raw.isna().any().any():
+        raise ValueError(
+            "The uploaded matrix contains empty cells. The file must contain only the complete Q matrix."
+        )
+
+    Q = np.zeros(raw.shape, dtype=float)
+    for i in range(raw.shape[0]):
+        for j in range(raw.shape[1]):
+            Q[i, j] = parse_q_value(raw.iat[i, j])
+
+    labels = [str(i) for i in range(Q.shape[0])]
+    return pd.DataFrame(Q, index=labels, columns=labels), file_signature
 
 
 def validate_generator(Q: np.ndarray, finite: bool):
@@ -673,42 +777,95 @@ else:
 
 finite = capacity_type == "Finite"
 
-if finite:
-    waiting_capacity = int(st.sidebar.number_input(
-        "Finite waiting-room capacity",
-        min_value=0,
-        max_value=100,
-        value=5,
-        step=1,
-        help="Maximum number of waiting customers, excluding service positions.",
-    ))
-    K = servers + waiting_capacity
-    max_state = K
-    st.sidebar.caption(f"Total system capacity: K = {K}. Q has {K + 1} states (0,...,{K}).")
-else:
-    K = None
-    max_state = int(st.sidebar.number_input(
-        "Last state represented explicitly in Q",
-        min_value=max(2, servers),
-        max_value=100,
-        value=max(7, servers + 3),
-        step=1,
+st.sidebar.markdown("---")
+st.sidebar.markdown("### Generator matrix Q input")
+q_input_mode = st.sidebar.radio(
+    "Matrix source",
+    ["Build / edit in the app", "Load CSV / Excel"],
+    index=0,
+    help=(
+        "The uploaded file must contain only the Q values, with no row names, "
+        "column names, or headers."
+    ),
+)
+
+uploaded_q_file = None
+uploaded_q_df = None
+upload_signature = None
+upload_error = None
+
+if q_input_mode == "Load CSV / Excel":
+    uploaded_q_file = st.sidebar.file_uploader(
+        "Upload generator matrix Q",
+        type=["csv", "xlsx", "xls"],
         help=(
-            "For an infinite queue, Q shows a finite leading block. The final row is treated as the "
-            "first state of the repeating tail, so choose it at a state from which the birth and death "
-            "rates remain unchanged."
+            "Use a square matrix containing only values. CSV and Excel files are read "
+            "without headers or index columns."
         ),
-    ))
-    st.sidebar.caption(
-        f"Q will show states 0,...,{max_state}. The last row also encodes the unshown transition "
-        f"{max_state} → {max_state + 1} through its diagonal."
     )
+
+    if uploaded_q_file is not None:
+        try:
+            uploaded_q_df, upload_signature = load_generator_matrix_file(uploaded_q_file)
+        except Exception as exc:
+            upload_error = str(exc)
+
+if q_input_mode == "Load CSV / Excel" and uploaded_q_df is not None:
+    max_state = uploaded_q_df.shape[0] - 1
+    K = max_state if finite else None
+
+    if finite:
+        inferred_waiting_capacity = max(max_state - servers, 0)
+        st.sidebar.caption(
+            f"Uploaded Q defines states 0,...,{max_state}; therefore total system capacity is K = {max_state}. "
+            f"With s = {servers}, the implied waiting-room capacity is {inferred_waiting_capacity}."
+        )
+    else:
+        st.sidebar.caption(
+            f"Uploaded Q defines the visible states 0,...,{max_state}. The final row is treated as "
+            "the first state of the repeating infinite tail."
+        )
+else:
+    if finite:
+        waiting_capacity = int(st.sidebar.number_input(
+            "Finite waiting-room capacity",
+            min_value=0,
+            max_value=100,
+            value=5,
+            step=1,
+            help="Maximum number of waiting customers, excluding service positions.",
+        ))
+        K = servers + waiting_capacity
+        max_state = K
+        st.sidebar.caption(f"Total system capacity: K = {K}. Q has {K + 1} states (0,...,{K}).")
+    else:
+        K = None
+        max_state = int(st.sidebar.number_input(
+            "Last state represented explicitly in Q",
+            min_value=max(2, servers),
+            max_value=100,
+            value=max(7, servers + 3),
+            step=1,
+            help=(
+                "For an infinite queue, Q shows a finite leading block. The final row is treated as the "
+                "first state of the repeating tail, so choose it at a state from which the birth and death "
+                "rates remain unchanged."
+            ),
+        ))
+        st.sidebar.caption(
+            f"Q will show states 0,...,{max_state}. The last row also encodes the unshown transition "
+            f"{max_state} → {max_state + 1} through its diagonal."
+        )
+
+if upload_error is not None:
+    st.sidebar.error(upload_error)
 
 st.sidebar.markdown("---")
 solve_clicked = st.sidebar.button(
     "Analyze queueing system",
     use_container_width=True,
     type="primary",
+    disabled=(q_input_mode == "Load CSV / Excel" and uploaded_q_df is None),
 )
 
 
@@ -718,9 +875,9 @@ st.markdown(
     """
     <div class="info-box">
         The queue is modeled as a continuous-time birth-death process. The editable
-        <b>generator matrix Q is the calculation input</b>. The queue parameters define the
-        problem context and provide a standard M/M/s starting template, but after Q is edited,
-        the transition rates used in the analysis are read directly from Q.
+        <b>generator matrix Q is the calculation input</b>. Q may be built directly in the app or
+        loaded from a CSV/Excel file containing only matrix values. The queue parameters define the
+        problem context; all transition rates used in the analysis are read directly from Q.
     </div>
     """,
     unsafe_allow_html=True,
@@ -738,15 +895,22 @@ tab_bd, tab_q, tab_ss, tab_metrics, tab_probs, tab_balance = st.tabs([
 ])
 
 
-# ── Q editor: rendered before solving so the clicked run uses current cells ──
-editor_shape_key = (capacity_type, model, servers, max_state)
-base_key = f"q_base_{capacity_type}_{model}_{servers}_{max_state}"
-reset_counter_key = f"q_reset_counter_{capacity_type}_{model}_{servers}_{max_state}"
+# ── Q editor / file-loaded Q: rendered before solving ────────────────────────
+if q_input_mode == "Load CSV / Excel" and uploaded_q_df is not None:
+    source_token = f"upload_{upload_signature}"
+else:
+    source_token = "manual"
+
+base_key = f"q_base_{source_token}_{capacity_type}_{model}_{servers}_{max_state}"
+reset_counter_key = f"q_reset_counter_{source_token}_{capacity_type}_{model}_{servers}_{max_state}"
 
 if base_key not in st.session_state:
     labels = [str(i) for i in range(max_state + 1)]
-    template = standard_generator_template(lam, mu, servers, max_state, finite)
-    st.session_state[base_key] = pd.DataFrame(template, index=labels, columns=labels)
+    if q_input_mode == "Load CSV / Excel" and uploaded_q_df is not None:
+        st.session_state[base_key] = uploaded_q_df.copy()
+    else:
+        template = standard_generator_template(lam, mu, servers, max_state, finite)
+        st.session_state[base_key] = pd.DataFrame(template, index=labels, columns=labels)
 
 if reset_counter_key not in st.session_state:
     st.session_state[reset_counter_key] = 0
@@ -758,10 +922,17 @@ with tab_q:
         r"q_{n,n}=-\sum_{j\ne n}q_{n,j}"
     )
 
-    st.info(
-        "Edit Q directly. For a birth-death queue, only the main diagonal and the two adjacent "
-        "diagonals may contain nonzero values. All off-diagonal transition rates must be nonnegative."
-    )
+    if q_input_mode == "Load CSV / Excel":
+        st.info(
+            "Q is loaded from the selected CSV/Excel file. The file must contain only the square matrix "
+            "of values: no title row, no state-name column, and no headers. After loading, the matrix is "
+            "shown in the editor and may still be adjusted before analysis."
+        )
+    else:
+        st.info(
+            "Edit Q directly. For a birth-death queue, only the main diagonal and the two adjacent "
+            "diagonals may contain nonzero values. All off-diagonal transition rates must be nonnegative."
+        )
 
     if finite:
         st.caption(
@@ -777,20 +948,31 @@ with tab_q:
 
     c_reset, c_note = st.columns([1, 3])
     with c_reset:
-        reset_q = st.button("Reset Q to standard M/M/s", use_container_width=True)
+        if q_input_mode == "Load CSV / Excel" and uploaded_q_df is not None:
+            reset_q = st.button("Reload Q from file", use_container_width=True)
+        else:
+            reset_q = st.button("Reset Q to standard M/M/s", use_container_width=True)
     with c_note:
-        st.caption(
-            "Reset uses the current λ, μ and s. Manual edits are preserved on normal Streamlit reruns."
-        )
+        if q_input_mode == "Load CSV / Excel":
+            st.caption(
+                "Reload discards edits made after the file was loaded and restores the uploaded matrix."
+            )
+        else:
+            st.caption(
+                "Reset uses the current λ, μ and s. Manual edits are preserved on normal Streamlit reruns."
+            )
 
     if reset_q:
         labels = [str(i) for i in range(max_state + 1)]
-        template = standard_generator_template(lam, mu, servers, max_state, finite)
-        st.session_state[base_key] = pd.DataFrame(template, index=labels, columns=labels)
+        if q_input_mode == "Load CSV / Excel" and uploaded_q_df is not None:
+            st.session_state[base_key] = uploaded_q_df.copy()
+        else:
+            template = standard_generator_template(lam, mu, servers, max_state, finite)
+            st.session_state[base_key] = pd.DataFrame(template, index=labels, columns=labels)
         st.session_state[reset_counter_key] += 1
 
     editor_key = (
-        f"q_editor_{capacity_type}_{model}_{servers}_{max_state}_"
+        f"q_editor_{source_token}_{capacity_type}_{model}_{servers}_{max_state}_"
         f"{st.session_state[reset_counter_key]}"
     )
 
@@ -802,8 +984,14 @@ with tab_q:
         key=editor_key,
     )
 
+    if q_input_mode == "Load CSV / Excel" and uploaded_q_df is not None:
+        st.success(
+            f"Loaded {uploaded_q_df.shape[0]} × {uploaded_q_df.shape[1]} Q matrix from "
+            f"{uploaded_q_file.name}. The number of represented states was detected automatically."
+        )
+
     st.caption(
-        "The analysis below is not based on a hidden server-activation rule. It derives λₙ and μₙ from the Q you enter here."
+        "All calculations below derive λₙ and μₙ from the Q currently displayed in this editor."
     )
 
 
@@ -823,6 +1011,8 @@ else:
 current_signature = (
     model,
     capacity_type,
+    q_input_mode,
+    upload_signature if q_input_mode == "Load CSV / Excel" else None,
     round(float(lam), 10),
     round(float(mu), 10),
     int(servers),
@@ -892,7 +1082,7 @@ if solve_clicked:
             "mu_tail": mu_tail,
             "tail_ratio": tail_ratio,
         }
-        st.success("Queueing system analyzed successfully from the edited generator matrix Q.")
+        st.success("Queueing system analyzed successfully from the generator matrix Q currently displayed in the editor.")
 
     except Exception as exc:
         st.session_state.pop("queue_solution_q", None)
